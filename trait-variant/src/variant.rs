@@ -8,16 +8,16 @@
 
 use std::iter;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
     token::Plus,
-    Error, FnArg, GenericParam, Ident, ItemTrait, Pat, PatType, Result, ReturnType, Signature,
-    Token, TraitBound, TraitItem, TraitItemConst, TraitItemFn, TraitItemType, Type, TypeGenerics,
-    TypeImplTrait, TypeParam, TypeParamBound,
+    Error, FnArg, GenericParam, Ident, ItemTrait, Pat, PatType, Path, Result, ReturnType,
+    Signature, Token, TraitBound, TraitBoundModifier, TraitItem, TraitItemConst, TraitItemFn,
+    TraitItemType, Type, TypeGenerics, TypeImplTrait, TypeParam, TypeParamBound,
 };
 
 struct Attrs {
@@ -77,6 +77,29 @@ pub fn make(
         #variant
 
         #blanket_impl
+    }
+    .into()
+}
+
+pub fn only_send(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let item = parse_macro_input!(item as ItemTrait);
+
+    let attrs = Attrs {
+        variant: MakeVariant {
+            name: item.ident.clone(),
+            colon: Default::default(),
+            bounds: Punctuated::from_iter(vec![TraitBound {
+                paren_token: None,
+                modifier: TraitBoundModifier::None,
+                lifetimes: None,
+                path: Path::from(Ident::new("Send", Span::call_site())),
+            }]),
+        },
+    };
+
+    let variant = mk_variant(&attrs, &item);
+    quote! {
+        #variant
     }
     .into()
 }
