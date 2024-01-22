@@ -9,16 +9,16 @@
 use std::iter;
 
 use proc_macro2::{Span, TokenStream};
-use quote::{quote, ToTokens};
+use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
-    token::{Comma, Plus},
-    Error, FnArg, GenericParam, Generics, Ident, ItemTrait, Lifetime, Pat, PatIdent, PatType,
-    Receiver, Result, ReturnType, Signature, Token, TraitBound, TraitItem, TraitItemConst,
-    TraitItemFn, TraitItemType, Type, TypeImplTrait, TypeParamBound, TypeReference, WhereClause,
+    token::Plus,
+    FnArg, Ident, ItemTrait, Pat, PatType, Path, Result, ReturnType, Signature, Token, TraitBound,
+    TraitBoundModifier, TraitItem, TraitItemFn, Type, TypeImplTrait, TypeParamBound,
 };
+use syn::{PatIdent, Receiver, TypeReference, WhereClause};
 
 struct Attrs {
     variant: MakeVariant,
@@ -49,34 +49,15 @@ impl Parse for MakeVariant {
     }
 }
 
-pub fn make(
-    attr: proc_macro::TokenStream,
-    item: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
-    let attrs = parse_macro_input!(attr as Attrs);
+pub fn only_send(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let item = parse_macro_input!(item as ItemTrait);
-
-    let maybe_allow_async_lint = if attrs
-        .variant
-        .bounds
-        .iter()
-        .any(|b| b.path.segments.last().unwrap().ident == "Send")
-    {
-        quote! { #[allow(async_fn_in_trait)] }
-    } else {
-        quote! {}
+    let ident = &item.ident;
+    let attrs = Attrs {
+        variant: syn::parse2(quote! { #ident: Send }).unwrap(),
     };
-
     let variant = mk_variant(&attrs, &item);
-    let blanket_impl = mk_blanket_impl(&attrs, &item);
-
     quote! {
-        #maybe_allow_async_lint
-        #item
-
         #variant
-
-        #blanket_impl
     }
     .into()
 }
@@ -198,139 +179,6 @@ fn transform_item(item: &TraitItem, bounds: &Vec<TypeParamBound>) -> TraitItem {
         default,
         ..fn_item.clone()
     })
-}
-
-fn mk_blanket_impl(attrs: &Attrs, tr: &ItemTrait) -> TokenStream {
-    let orig = &tr.ident;
-    let generics = &tr.generics.params;
-    let mut generic_names = tr
-        .generics
-        .params
-        .iter()
-        .map(|generic| match generic {
-            GenericParam::Lifetime(lt) => GenericParamName::Lifetime(&lt.lifetime),
-            GenericParam::Type(ty) => GenericParamName::Type(&ty.ident),
-            GenericParam::Const(co) => GenericParamName::Const(&co.ident),
-        })
-        .collect::<Punctuated<_, Comma>>();
-    let trailing_comma = if !generic_names.is_empty() {
-        generic_names.push_punct(Comma::default());
-        quote! { , }
-    } else {
-        quote! {}
-    };
-    let variant = &attrs.variant.name;
-    let items = tr
-        .items
-        .iter()
-        .map(|item| blanket_impl_item(item, variant, &generic_names));
-    let mut where_clauses = tr
-        .generics
-        .where_clause
-        .as_ref()
-        .map(|wh| wh.predicates.clone())
-        .unwrap_or_default();
-    let self_is_sync = tr.items.iter().any(|item| {
-        matches!(
-            item,
-            TraitItem::Fn(TraitItemFn {
-                default: Some(_),
-                ..
-            })
-        )
-    });
-
-    if self_is_sync {
-        where_clauses.push(parse_quote! { for<'s> &'s Self: Send });
-    }
-
-    quote! {
-        impl<#generics #trailing_comma TraitVariantBlanketType> #orig<#generic_names>
-        for TraitVariantBlanketType
-        where TraitVariantBlanketType: #variant<#generic_names>, #where_clauses
-        {
-            #(#items)*
-        }
-    }
-}
-
-enum GenericParamName<'s> {
-    Lifetime(&'s Lifetime),
-    Type(&'s Ident),
-    Const(&'s Ident),
-}
-
-impl ToTokens for GenericParamName<'_> {
-    fn to_tokens(&self, tokens: &mut TokenStream) {
-        match self {
-            GenericParamName::Lifetime(lt) => lt.to_tokens(tokens),
-            GenericParamName::Type(ty) => ty.to_tokens(tokens),
-            GenericParamName::Const(co) => co.to_tokens(tokens),
-        }
-    }
-}
-
-fn blanket_impl_item(
-    item: &TraitItem,
-    variant: &Ident,
-    generic_names: &Punctuated<GenericParamName<'_>, Comma>,
-) -> TokenStream {
-    // impl<T> IntFactory for T where T: SendIntFactory {
-    //     const NAME: &'static str = <Self as SendIntFactory>::NAME;
-    //     type MyFut<'a> = <Self as SendIntFactory>::MyFut<'a> where Self: 'a;
-    //     async fn make(&self, x: u32, y: &str) -> i32 {
-    //         <Self as SendIntFactory>::make(self, x, y).await
-    //     }
-    // }
-    match item {
-        TraitItem::Const(TraitItemConst {
-            ident,
-            generics,
-            ty,
-            ..
-        }) => {
-            quote! {
-                const #ident #generics: #ty = <Self as #variant<#generic_names>>::#ident;
-            }
-        }
-        TraitItem::Fn(TraitItemFn { sig, .. }) => {
-            let ident = &sig.ident;
-            let args = sig.inputs.iter().map(|arg| match arg {
-                FnArg::Receiver(_) => quote! { self },
-                FnArg::Typed(PatType { pat, .. }) => match &**pat {
-                    Pat::Ident(arg) => quote! { #arg },
-                    _ => Error::new_spanned(pat, "patterns are not supported in arguments")
-                        .to_compile_error(),
-                },
-            });
-            let maybe_await = if sig.asyncness.is_some() {
-                quote! { .await }
-            } else {
-                quote! {}
-            };
-
-            quote! {
-                #sig {
-                    <Self as #variant<#generic_names>>::#ident(#(#args),*)#maybe_await
-                }
-            }
-        }
-        TraitItem::Type(TraitItemType {
-            ident,
-            generics:
-                Generics {
-                    params,
-                    where_clause,
-                    ..
-                },
-            ..
-        }) => {
-            quote! {
-                type #ident<#params> = <Self as #variant<#generic_names>>::#ident<#params> #where_clause;
-            }
-        }
-        _ => Error::new_spanned(item, "unsupported item type").into_compile_error(),
-    }
 }
 
 fn add_receiver_bounds(sig: &mut Signature) {
